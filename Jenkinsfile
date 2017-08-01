@@ -1,57 +1,89 @@
 def dockerBuildTag = 'latest'
-def buildVersion = null
 def mobileDepositUiImage = null
-stage 'build'
-node('docker-cloud') {
-    //docker.withServer('tcp://127.0.0.1:1234'){ //run the following steps on this Docker host
-            docker.image('kmadel/maven:3.3.3-jdk-8').inside('-v /data:/data') { //use this image as the build environment
-                checkout([$class: 'GitSCM', branches: [[name: '*/master']], doGenerateSubmoduleConfigurations: false, extensions: [], submoduleCfg: [], userRemoteConfigs: [[url: 'https://github.com/cloudbees/mobile-deposit-ui.git']]])
-                sh 'mvn -Dmaven.repo.local=/data/mvn/repo clean package'
+def buildVersion = null
+def short_commit = null
 
-                //get new version of application from pom
-                def matcher = readFile('pom.xml') =~ '<version>(.+)</version>'
-                if (matcher) {
-                    buildVersion = matcher[0][1]
-                    echo "Released version ${buildVersion}"
-                }
-                matcher = null
-            }
-    //}
+env.DOCKER_HUB_USER = 'beedemo'
+env.DOCKER_CREDENTIAL_ID = 'docker-hub-beedemo'
 
-    //build image and deploy to staging
-    docker.withServer('tcp://52.27.249.236:3376', 'beedemo-swarm-cert') { //run following steps on our staging server
-        stage 'build docker image'
-        dir('target') {
-            mobileDepositUiImage = docker.build "mobile-deposit-ui:${buildVersion}"
+if(env.BRANCH_NAME=="master"){
+    properties([pipelineTriggers(triggers: [[$class: 'DockerHubTrigger', options: [[$class: 'TriggerOnSpecifiedImageNames', repoNames: ['beedemo/mobile-deposit-api'] as Set]]]]),
+                [$class: 'BuildDiscarderProperty', strategy: [$class: 'LogRotator', artifactDaysToKeepStr: '', artifactNumToKeepStr: '', daysToKeepStr: '', numToKeepStr: '5']]])
+}
+
+
+node('docker-compose') {
+    checkout scm
+    stage('build') {
+        sh('git rev-parse HEAD > GIT_COMMIT')
+        git_commit=readFile('GIT_COMMIT')
+        short_commit=git_commit.take(7)
+        sh 'docker run -i --rm -v "$PWD":/usr/src/mobile-deposit-ui -w /usr/src/mobile-deposit-ui maven:3.3-jdk-8 mvn -Dmaven.repo.local=/data/mvn/repo clean package -DskipTests'
+
+        //get new version of application from pom
+        def matcher = readFile('pom.xml') =~ '<version>(.+)</version>'
+        if (matcher) {
+            buildVersion = matcher[0][1]
+            echo "Released version ${buildVersion}"
         }
-        try {
-            sh "docker stop mobile-deposit-ui-stage"
-            sh "docker rm mobile-deposit-ui-stage"
-        } catch (Exception _) {
-            echo "no container to stop"
-        }
-        stage 'deploy to staging'
-        mobileDepositUiImage.run("--name mobile-deposit-ui-stage -p 82:8080 --env='constraint:node==beedemo-swarm-master'")
+        matcher = null
     }
-    docker.image('kmadel/maven:3.3.3-jdk-8').inside('-v /data:/data') {
-        stage 'functional-test'
-        sh 'mvn -Dmaven.repo.local=/data/mvn/repo verify'
+    stage('functional-test') {
+        try {
+            sh 'docker-compose up -d'
+            parallel(
+                "firefox": {
+                    sh 'docker pull selenoid/firefox:46.0'
+                    sh 'docker run -i --rm -p 8081:8081 -v "$PWD":/usr/src/mobile-deposit-ui -w /usr/src/mobile-deposit-ui maven:3.3-jdk-8 mvn -Dmaven.repo.local=/data/mvn/repo verify -DargLine="-Dtest.host=172.17.0.1 -Dtest.browser.name=firefox -Dtest.browser.version=46.0 -Dserver.port=8081"'
+                },
+                "chrome": {
+                    sh 'docker pull selenoid/chrome:59.0'
+                    sh 'docker run -i --rm -p 8082:8082 -v "$PWD":/usr/src/mobile-deposit-ui -w /usr/src/mobile-deposit-ui maven:3.3-jdk-8 mvn -Dmaven.repo.local=/data/mvn/repo verify -DargLine="-Dtest.host=172.17.0.1 -Dtest.browser.name=chrome -Dtest.browser.version=59.0 -Dserver.port=8082"'
+                }, failFast: true
+            )
+        } catch(x) {
+            //error
+            throw x
+        } finally {
+            sh 'docker-compose down'
+        }
+    }
+    //docker tag to be used for build, push and run
+    def dockerTag = "${env.BUILD_NUMBER}-${short_commit}"
+    //build image and deploy to staging
+    stage('build docker image') {
+        dir('target') {
+            mobileDepositUiImage = docker.build "beedemo/mobile-deposit-ui-stage:${dockerTag}"
+        }
+    }
+
+    stage('deploy to staging') {
+        //use withDockerRegistry to make sure we are logged in to docker hub registry
+        withDockerRegistry(registry: [credentialsId: 'docker-hub-beedemo']) {
+          mobileDepositUiImage.push()
+        }
+        dockerDeploy("docker-cloud","${DOCKER_HUB_USER}", 'mobile-deposit-ui-stage', 82, 8080, "$dockerTag")
     }
 }
-stage 'awaiting approval'
-//put input step outside of node so it doesn't tie up a slave
-input 'UI Staged at http://52.27.249.236:82/deposit - Proceed with Production Deployment?'
-stage 'deploy to production'
-node('docker-cloud') {
-    docker.withServer('tcp://52.27.249.236:3376', 'beedemo-swarm-cert'){
-        try{
-            sh "docker stop mobile-deposit-ui"
-            sh "docker rm mobile-deposit-ui"
-        } catch (Exception _) {
-            echo "no container to stop"
-        }
-        mobileDepositUiImage.run("--name mobile-deposit-ui -p 80:8080 --env='constraint:node==beedemo-swarm-master'")
-        //sh 'curl http://webhook:58f11cf04cecbe5633031217794eda89@jenkins.beedemo.net/mobile-team/docker-traceability/submitContainerStatus --data-urlencode inspectData="$(docker inspect mobile-deposit-ui)"'
-    }
 
+
+stage('awaiting approval') {
+    //put input step outside of node so it doesn't tie up a slave
+    timeout(time: 10, unit: 'MINUTES') {
+        input 'UI Staged at http://bank.beedemo.net:82/deposit - Proceed with Production Deployment?'
+    }
+}
+
+if(env.BRANCH_NAME=="master") {//only deploy master branch to prod
+    stage('deploy to production') {
+        node('docker-cloud') {
+            def dockerTag = "${env.BUILD_NUMBER}-${short_commit}"
+            sh "docker tag beedemo/mobile-deposit-ui-stage:${dockerTag} beedemo/mobile-deposit-ui:${dockerTag}"
+            //use withDockerRegistry to make sure we are logged in to docker hub registry
+            withDockerRegistry(registry: [credentialsId: 'docker-hub-beedemo']) {
+              sh "docker push beedemo/mobile-deposit-ui:${dockerTag}"
+            }
+            dockerDeploy("docker-cloud","${DOCKER_HUB_USER}", 'mobile-deposit-ui', 80, 8080, "$dockerTag")
+        }
+    }
 }
